@@ -1,0 +1,20 @@
+#!/bin/sh
+# Plugin panes inherit the Herdr *server's* environment. When the server was
+# started by launchd or systemd, PATH is a bare /usr/bin:/bin:/usr/sbin:/sbin and
+# node is unreachable, so the popup would die before painting anything. Repair the
+# common prefixes with shell builtins first — the healthy path pays nothing.
+for candidate in /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/local/sbin \
+                 /home/linuxbrew/.linuxbrew/bin "$HOME/.nix-profile/bin" "$HOME/.local/bin"; do
+    [ -d "$candidate" ] && PATH="$candidate:$PATH"
+done
+export PATH
+
+# Anything that list cannot guess — nvm, fnm, asdf, a custom prefix — is worth a
+# login shell, but only once the free lookup has already missed.
+if ! command -v node >/dev/null 2>&1; then
+    login_path=$("${SHELL:-/bin/sh}" -lc 'printf %s "$PATH"' 2>/dev/null)
+    [ -n "$login_path" ] && export PATH="$login_path"
+fi
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec node "$script_dir/palette.js" "$@"

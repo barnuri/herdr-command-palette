@@ -1,0 +1,27 @@
+id = "barnuri.command-palette"
+name = "Command Palette"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "F1-style command palette: fuzzy-search and run every action from every installed herdr plugin"
+platforms = ["linux", "macos"]
+
+# Runs server-side with no TTY, so it can only open the popup. It captures the
+# still-focused origin pane first: a popup is not a Herdr pane and its process
+# never receives HERDR_PANE_ID, so it cannot discover that context itself.
+[[actions]]
+id = "open"
+title = "Open command palette"
+contexts = ["workspace", "tab", "pane"]
+command = ["node", "bin/open-palette.js"]
+
+# placement = "popup" is session-modal: it overlays the tiled layout without
+# disturbing it, receives every keystroke including Escape, and closes when the
+# command exits. bin/herdr-palette is a POSIX sh trampoline that repairs PATH before
+# exec'ing node, because plugin panes inherit the Herdr server's environment.
+[[panes]]
+id = "palette"
+title = "Command Palette"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/bin/herdr-palette\""]
