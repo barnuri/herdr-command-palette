@@ -2,6 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const childProcess = require('node:child_process');
 const { EventEmitter } = require('node:events');
 
 const Palette = require('../bin/palette.js');
@@ -314,24 +318,55 @@ test('entryColumns and choiceColumns map each shape onto the same three columns'
     });
 });
 
-test('dispatch builds an --action request for a plugin entry and --command for a native one', () => {
+// dispatch records the use before it spawns, so the store has to be redirected
+// as well as the spawn stubbed — otherwise the run mutates the real recents file.
+function captureDispatch(dispatches) {
+    const originalSpawn = childProcess.spawn;
+    const originalStateDirectory = process.env.HERDR_PLUGIN_STATE_DIR;
+    const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'palette-dispatch-'));
     const spawned = [];
-    const original = require('node:child_process').spawn;
-    require('node:child_process').spawn = (command, args) => {
-        spawned.push(args.slice(1));
+
+    process.env.HERDR_PLUGIN_STATE_DIR = stateDirectory;
+    childProcess.spawn = (command, args, options) => {
+        spawned.push({ command, args, options });
         return { unref() {} };
     };
 
     try {
+        dispatches();
+    } finally {
+        childProcess.spawn = originalSpawn;
+        if (originalStateDirectory === undefined) {
+            delete process.env.HERDR_PLUGIN_STATE_DIR;
+        } else {
+            process.env.HERDR_PLUGIN_STATE_DIR = originalStateDirectory;
+        }
+        fs.rmSync(stateDirectory, { recursive: true, force: true });
+    }
+
+    return spawned;
+}
+
+test('dispatch builds an --action request for a plugin entry and --command for a native one', () => {
+    const spawned = captureDispatch(() => {
         Palette.dispatch(entry('One'), null);
         Palette.dispatch(
             { kind: 'native', id: 'tab.close', title: 'Tab: Close current' },
             ['tab', 'close', 'wE:t8']
         );
-    } finally {
-        require('node:child_process').spawn = original;
-    }
+    });
 
-    assert.deepEqual(spawned[0], ['--action', 'acme.tools', 'open']);
-    assert.deepEqual(spawned[1], ['--command', 'tab', 'close', 'wE:t8']);
+    assert.equal(spawned.length, 2);
+    assert.deepEqual(spawned[0].args.slice(1), ['--action', 'acme.tools', 'one']);
+    assert.deepEqual(spawned[1].args.slice(1), ['--command', 'tab', 'close', 'wE:t8']);
+});
+
+test('dispatch runs the invoker detached so the popup can exit immediately', () => {
+    const [spawned] = captureDispatch(() => {
+        Palette.dispatch(entry('One'), null);
+    });
+
+    assert.equal(spawned.command, process.execPath);
+    assert.equal(path.basename(spawned.args[0]), Palette.INVOKER_SCRIPT);
+    assert.deepEqual(spawned.options, { detached: true, stdio: 'ignore' });
 });

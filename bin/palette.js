@@ -2,7 +2,9 @@
 'use strict';
 
 const path = require('node:path');
-const { spawn } = require('node:child_process');
+// Held as a module reference rather than destructured so a test can substitute
+// `spawn` and dispatch never launches a real detached process.
+const childProcess = require('node:child_process');
 
 const { listPluginActions, listPlugins, listWorkspaces, listTabs } = require('../lib/herdr');
 const { buildPluginEntries, pluginNameLookup } = require('../lib/actions');
@@ -530,7 +532,7 @@ class Palette {
             entry.kind === 'native'
                 ? ['--command', ...argv]
                 : ['--action', entry.pluginId, entry.actionId];
-        const child = spawn(process.execPath, [path.join(__dirname, Palette.INVOKER_SCRIPT), ...args], {
+        const child = childProcess.spawn(process.execPath, [path.join(__dirname, Palette.INVOKER_SCRIPT), ...args], {
             detached: true,
             stdio: 'ignore',
         });
