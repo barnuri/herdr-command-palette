@@ -4,8 +4,13 @@
 const path = require('node:path');
 const { spawn } = require('node:child_process');
 
-const { listPluginActions, listPlugins } = require('../lib/herdr');
-const { buildActionList, pluginNameLookup, searchText } = require('../lib/actions');
+const { listPluginActions, listPlugins, listWorkspaces, listTabs } = require('../lib/herdr');
+const { buildPluginEntries, pluginNameLookup } = require('../lib/actions');
+const { mergeEntries, searchText } = require('../lib/entries');
+const { loadCatalog } = require('../lib/catalog');
+const { buildContext } = require('../lib/context');
+const { selectorChoices } = require('../lib/selectors');
+const { resolveCommand } = require('../lib/resolve');
 const { fuzzyFilter } = require('../lib/fuzzy');
 const { loadChords } = require('../lib/keybindings');
 const { loadRecents, recordUse, rankLookup } = require('../lib/recents');
@@ -21,6 +26,7 @@ class Palette {
         inverse: '\x1b[7m',
         cyan: '\x1b[36m',
         yellow: '\x1b[33m',
+        red: '\x1b[31m',
     };
 
     static KEY = {
@@ -41,6 +47,10 @@ class Palette {
         end: '\x1b[F',
     };
 
+    static LIST_MODE = 'list';
+
+    static INPUT_MODE = 'input';
+
     static DEFAULT_ROWS = 24;
 
     static DEFAULT_COLUMNS = 80;
@@ -53,7 +63,7 @@ class Palette {
 
     static COLUMN_GAP = 2;
 
-    static MAX_PLUGIN_WIDTH = 22;
+    static MAX_SOURCE_WIDTH = 22;
 
     static MAX_CHORD_WIDTH = 18;
 
@@ -63,9 +73,32 @@ class Palette {
 
     static ESCAPE_SEQUENCE = /\x1b(\[[0-9;?]*[ -/]*[@-~]|O.|.)?/g;
 
+    // A popup PTY commonly runs with application cursor keys (DECCKM) enabled, so
+    // the arrows arrive as SS3 (`\x1bOA`) instead of CSI (`\x1b[A`). Fold both
+    // encodings onto one key name rather than betting on the host's mode.
+    static SS3_TO_CSI = {
+        '\x1bOA': '\x1b[A',
+        '\x1bOB': '\x1b[B',
+        '\x1bOC': '\x1b[C',
+        '\x1bOD': '\x1b[D',
+        '\x1bOH': '\x1b[H',
+        '\x1bOF': '\x1b[F',
+    };
+
+    static KEY_ALIASES = {
+        '\x1b[1~': '\x1b[H',
+        '\x1b[7~': '\x1b[H',
+        '\x1b[4~': '\x1b[F',
+        '\x1b[8~': '\x1b[F',
+    };
+
+    static SEQUENCE_FINAL = /[@-~]/;
+
     static PLUGIN_ID = 'barnuri.command-palette';
 
     static INVOKER_SCRIPT = 'invoke.js';
+
+    static CANCELLED = null;
 
     static truncate(text, width) {
         if (width <= 0) {
@@ -98,15 +131,93 @@ class Palette {
         return printable;
     }
 
-    constructor({ actions, input = process.stdin, output = process.stdout } = {}) {
-        this.actions = actions;
+    static readSequence(chunk, start) {
+        const introducer = chunk[start + 1];
+
+        if (introducer === '[') {
+            let end = start + 2;
+            while (end < chunk.length && !Palette.SEQUENCE_FINAL.test(chunk[end])) {
+                end += 1;
+            }
+            return chunk.slice(start, Math.min(end + 1, chunk.length));
+        }
+        if (introducer === 'O' && chunk.length > start + 2) {
+            return chunk.slice(start, start + 3);
+        }
+        return Palette.KEY.escape;
+    }
+
+    static normalizeKey(sequence) {
+        const csi = Palette.SS3_TO_CSI[sequence] || sequence;
+        return Palette.KEY_ALIASES[csi] || csi;
+    }
+
+    // One read can carry several keys — an arrow pressed while text is still in
+    // flight, or a key repeat. Comparing the whole chunk against a single key
+    // loses every one of them, so split it into keys first.
+    static splitKeys(chunk) {
+        const keys = [];
+        let text = '';
+        let index = 0;
+
+        const flush = () => {
+            if (text.length > 0) {
+                keys.push(text);
+                text = '';
+            }
+        };
+
+        while (index < chunk.length) {
+            const character = chunk[index];
+
+            if (character === Palette.KEY.escape) {
+                flush();
+                const sequence = Palette.readSequence(chunk, index);
+                keys.push(Palette.normalizeKey(sequence));
+                index += sequence.length;
+                continue;
+            }
+
+            const code = character.codePointAt(0);
+            if (code < 0x20 || code === 0x7f) {
+                flush();
+                keys.push(character);
+                index += 1;
+                continue;
+            }
+
+            text += character;
+            index += 1;
+        }
+
+        flush();
+        return keys;
+    }
+
+    static entryColumns(entry) {
+        return { title: entry.title, source: entry.sourceLabel, chord: entry.chord || '' };
+    }
+
+    static choiceColumns(choice) {
+        return { title: choice.label, source: '', chord: '' };
+    }
+
+    constructor({ input = process.stdin, output = process.stdout } = {}) {
         this.input = input;
         this.output = output;
+        this.started = false;
+        this.pending = null;
+        this.mode = Palette.LIST_MODE;
+        this.promptLabel = '';
         this.query = '';
+        this.items = [];
+        this.visible = [];
         this.selectedIndex = 0;
         this.scrollOffset = 0;
-        this.visible = actions;
-        this.chosen = null;
+        this.columnsOf = Palette.entryColumns;
+        this.searchOf = searchText;
+        this.required = false;
+        this.status = '';
     }
 
     get rows() {
@@ -121,8 +232,71 @@ class Palette {
         return Math.max(1, this.rows - Palette.CHROME_ROWS);
     }
 
+    start() {
+        if (this.started) {
+            return;
+        }
+        this.started = true;
+
+        if (this.input.isTTY) {
+            this.input.setRawMode(true);
+        }
+        this.input.setEncoding('utf8');
+        this.input.resume();
+        this.output.write(Palette.ANSI.hideCursor);
+        this.output.on('resize', () => this.render());
+        this.input.on('data', (chunk) => this.handleChunk(chunk));
+    }
+
+    close() {
+        this.input.removeAllListeners('data');
+        if (this.input.isTTY) {
+            this.input.setRawMode(false);
+        }
+        this.input.pause();
+        this.output.write(`${Palette.ANSI.showCursor}${Palette.ANSI.clear}`);
+    }
+
+    settle(value) {
+        const { pending } = this;
+        this.pending = null;
+        this.status = '';
+        if (pending !== null) {
+            pending(value);
+        }
+    }
+
+    chooseFromList({ prompt = '', items, columnsOf = Palette.entryColumns, searchOf = searchText } = {}) {
+        this.mode = Palette.LIST_MODE;
+        this.promptLabel = prompt;
+        this.query = '';
+        this.items = items;
+        this.columnsOf = columnsOf;
+        this.searchOf = searchOf;
+        this.applyQuery();
+        this.start();
+        this.render();
+
+        return new Promise((resolve) => {
+            this.pending = resolve;
+        });
+    }
+
+    promptForInput({ prompt = '', initial = '', required = false } = {}) {
+        this.mode = Palette.INPUT_MODE;
+        this.promptLabel = prompt;
+        this.query = initial;
+        this.required = required;
+        this.start();
+        this.render();
+
+        return new Promise((resolve) => {
+            this.pending = resolve;
+        });
+    }
+
     applyQuery() {
-        this.visible = fuzzyFilter(this.actions, this.query, searchText);
+        this.visible = fuzzyFilter(this.items, this.query, this.searchOf);
         this.selectedIndex = 0;
         this.scrollOffset = 0;
     }
@@ -145,81 +319,154 @@ class Palette {
     }
 
     columnWidths(window) {
-        const longestPlugin = window.reduce((widest, action) => Math.max(widest, action.pluginLabel.length), 0);
-        const longestChord = window.reduce((widest, action) => Math.max(widest, action.chord.length), 0);
-        const pluginWidth = Math.min(Palette.MAX_PLUGIN_WIDTH, longestPlugin);
+        const columns = window.map(this.columnsOf);
+        const longestSource = columns.reduce((widest, column) => Math.max(widest, column.source.length), 0);
+        const longestChord = columns.reduce((widest, column) => Math.max(widest, column.chord.length), 0);
+        const sourceWidth = Math.min(Palette.MAX_SOURCE_WIDTH, longestSource);
         const chordWidth = Math.min(Palette.MAX_CHORD_WIDTH, longestChord);
-        const used = Palette.MARKER_WIDTH + pluginWidth + chordWidth + Palette.COLUMN_GAP * 2;
+        const used = Palette.MARKER_WIDTH + sourceWidth + chordWidth + Palette.COLUMN_GAP * 2;
         const titleWidth = Math.max(Palette.MIN_TITLE_WIDTH, this.columns - used - 1);
-        return { pluginWidth, chordWidth, titleWidth };
+        return { sourceWidth, chordWidth, titleWidth };
     }
 
-    renderRow(action, isSelected, widths) {
+    renderRow(item, isSelected, widths) {
         const { ANSI } = Palette;
+        const column = this.columnsOf(item);
         const marker = isSelected ? `${ANSI.cyan}▸ ${ANSI.reset}` : '  ';
-        const title = Palette.truncate(action.title, widths.titleWidth);
-        const plugin = Palette.truncate(action.pluginLabel, widths.pluginWidth);
-        const chord = Palette.truncate(action.chord, widths.chordWidth);
         const titleStyle = isSelected ? ANSI.bold : '';
         const gap = ' '.repeat(Palette.COLUMN_GAP);
 
         return (
-            `${marker}${titleStyle}${title}${ANSI.reset}${gap}` +
-            `${ANSI.dim}${plugin}${ANSI.reset}${gap}${ANSI.yellow}${chord}${ANSI.reset}`
+            `${marker}${titleStyle}${Palette.truncate(column.title, widths.titleWidth)}${ANSI.reset}${gap}` +
+            `${ANSI.dim}${Palette.truncate(column.source, widths.sourceWidth)}${ANSI.reset}${gap}` +
+            `${ANSI.yellow}${Palette.truncate(column.chord, widths.chordWidth)}${ANSI.reset}`
         );
+    }
+
+    promptLine(counter) {
+        const { ANSI } = Palette;
+        const label = this.promptLabel.length > 0 ? `${this.promptLabel} ` : '';
+        const head = `${ANSI.cyan}${label}❯ ${ANSI.reset}${this.query}${ANSI.inverse} ${ANSI.reset}`;
+        const padding = Math.max(1, this.columns - label.length - this.query.length - counter.length - 4);
+        return `${head}${' '.repeat(padding)}${ANSI.dim}${counter}${ANSI.reset}`;
     }
 
     renderEmptyState() {
         const { ANSI } = Palette;
-        if (this.actions.length === 0) {
-            return `  ${ANSI.dim}No plugin actions are installed.${ANSI.reset}`;
+        if (this.items.length === 0) {
+            return `  ${ANSI.dim}Nothing to choose here.${ANSI.reset}`;
         }
-        return `  ${ANSI.dim}No action matches "${this.query}".${ANSI.reset}`;
+        return `  ${ANSI.dim}No entry matches "${this.query}".${ANSI.reset}`;
     }
 
-    render() {
+    renderInput() {
+        const { ANSI } = Palette;
+        const lines = [this.promptLine('')];
+        lines.push(`${ANSI.dim}${'─'.repeat(Math.max(1, this.columns - 1))}${ANSI.reset}`);
+        if (this.status.length > 0) {
+            lines.push(`  ${ANSI.red}${this.status}${ANSI.reset}`);
+        }
+        lines.push('');
+        lines.push(`${ANSI.dim}⏎ confirm  esc cancel${ANSI.reset}`);
+        return lines;
+    }
+
+    renderList() {
         const { ANSI } = Palette;
         const window = this.visible.slice(this.scrollOffset, this.scrollOffset + this.pageSize);
         const widths = this.columnWidths(window);
-
-        const counter = `${this.visible.length}/${this.actions.length}`;
-        const promptText = `${ANSI.cyan}❯ ${ANSI.reset}${this.query}${ANSI.inverse} ${ANSI.reset}`;
-        const promptPadding = Math.max(
-            1,
-            this.columns - this.query.length - counter.length - 4
-        );
-
         const lines = [
-            `${promptText}${' '.repeat(promptPadding)}${ANSI.dim}${counter}${ANSI.reset}`,
+            this.promptLine(`${this.visible.length}/${this.items.length}`),
             `${ANSI.dim}${'─'.repeat(Math.max(1, this.columns - 1))}${ANSI.reset}`,
         ];
 
         if (window.length === 0) {
             lines.push(this.renderEmptyState());
         } else {
-            window.forEach((action, offset) => {
-                lines.push(this.renderRow(action, this.scrollOffset + offset === this.selectedIndex, widths));
+            window.forEach((item, offset) => {
+                lines.push(this.renderRow(item, this.scrollOffset + offset === this.selectedIndex, widths));
             });
         }
 
         lines.push('');
         lines.push(`${ANSI.dim}↑↓ select  ⏎ run  esc close${ANSI.reset}`);
-
-        this.output.write(`${ANSI.clear}${lines.join('\r\n')}`);
+        return lines;
     }
 
-    handleChunk(chunk) {
+    render() {
+        const lines = this.mode === Palette.INPUT_MODE ? this.renderInput() : this.renderList();
+        this.output.write(`${Palette.ANSI.clear}${lines.join('\r\n')}`);
+    }
+
+    confirmInput() {
+        if (this.required && this.query.trim().length === 0) {
+            this.status = 'This value is required.';
+            this.render();
+            return;
+        }
+        this.settle(this.query);
+    }
+
+    editQuery(chunk) {
         const { KEY } = Palette;
 
         switch (chunk) {
-            case KEY.ctrlC:
-            case KEY.escape:
-                this.finish(null);
+            case KEY.backspace:
+                this.query = this.query.slice(0, -1);
+                return true;
+            case KEY.ctrlW:
+                this.query = Palette.deleteLastWord(this.query);
+                return true;
+            case KEY.ctrlU:
+                this.query = '';
+                return true;
+            default: {
+                const printable = Palette.printableFrom(chunk);
+                if (printable.length === 0) {
+                    return false;
+                }
+                this.query += printable;
+                return true;
+            }
+        }
+    }
+
+    handleChunk(chunk) {
+        for (const key of Palette.splitKeys(chunk)) {
+            // A settled prompt has handed control back to the caller; the rest of
+            // this read belongs to whatever it opens next, not to this list.
+            if (this.pending === null) {
                 return;
-            case KEY.enter:
-            case KEY.newline:
-                this.finish(this.visible[this.selectedIndex] || null);
+            }
+            this.handleKey(key);
+        }
+    }
+
+    handleKey(chunk) {
+        const { KEY } = Palette;
+
+        if (chunk === KEY.ctrlC || chunk === KEY.escape) {
+            this.settle(Palette.CANCELLED);
+            return;
+        }
+        if (chunk === KEY.enter || chunk === KEY.newline) {
+            if (this.mode === Palette.INPUT_MODE) {
+                this.confirmInput();
                 return;
+            }
+            this.settle(this.visible[this.selectedIndex] || Palette.CANCELLED);
+            return;
+        }
+
+        if (this.mode === Palette.INPUT_MODE) {
+            if (this.editQuery(chunk)) {
+                this.status = '';
+                this.render();
+            }
+            return;
+        }
+
+        switch (chunk) {
             case KEY.up:
             case KEY.ctrlP:
                 this.moveSelection(-1);
@@ -240,107 +487,109 @@ class Palette {
             case KEY.end:
                 this.moveSelection(this.visible.length);
                 break;
-            case KEY.backspace:
-                this.query = this.query.slice(0, -1);
-                this.applyQuery();
-                break;
-            case KEY.ctrlW:
-                this.query = Palette.deleteLastWord(this.query);
-                this.applyQuery();
-                break;
-            case KEY.ctrlU:
-                this.query = '';
-                this.applyQuery();
-                break;
-            default: {
-                const printable = Palette.printableFrom(chunk);
-                if (printable.length === 0) {
+            default:
+                if (!this.editQuery(chunk)) {
                     return;
                 }
-                this.query += printable;
                 this.applyQuery();
-            }
         }
 
         this.render();
     }
 
-    finish(action) {
-        this.chosen = action;
-        this.teardown();
-        if (this.resolve) {
-            this.resolve(action);
+    static loadContext() {
+        let workspaces = [];
+        let tabs = [];
+        try {
+            workspaces = listWorkspaces();
+            tabs = listTabs(process.env.PALETTE_ORIGIN_WORKSPACE_ID);
+        } catch (error) {
+            process.stderr.write(`command-palette: could not read the session layout: ${error.message}\n`);
         }
+        return buildContext({ env: process.env, workspaces, tabs });
     }
 
-    teardown() {
-        const { ANSI } = Palette;
-        this.input.removeAllListeners('data');
-        if (this.input.isTTY) {
-            this.input.setRawMode(false);
-        }
-        this.input.pause();
-        this.output.write(`${ANSI.showCursor}${ANSI.clear}`);
-    }
-
-    run() {
-        const { ANSI } = Palette;
-        this.applyQuery();
-
-        if (this.input.isTTY) {
-            this.input.setRawMode(true);
-        }
-        this.input.setEncoding('utf8');
-        this.input.resume();
-        this.output.write(ANSI.hideCursor);
-        this.output.on('resize', () => this.render());
-        this.render();
-
-        return new Promise((resolve) => {
-            this.resolve = resolve;
-            this.input.on('data', (chunk) => this.handleChunk(chunk));
-        });
-    }
-
-    static loadActions() {
-        const rawActions = listPluginActions();
-        const pluginNames = pluginNameLookup(listPlugins());
-        return buildActionList(rawActions, {
+    static loadEntries(context) {
+        const pluginEntries = buildPluginEntries(listPluginActions(), {
             excludePluginId: process.env.HERDR_PLUGIN_ID || Palette.PLUGIN_ID,
-            pluginNames,
+            pluginNames: pluginNameLookup(listPlugins()),
+        });
+
+        return mergeEntries([pluginEntries, loadCatalog(context)], {
             chords: loadChords(),
             rankOf: rankLookup(loadRecents()),
         });
     }
 
-    // The chosen action cannot run from here: this process owns a session-modal
-    // popup, so anything that opens a pane or popup of its own would be refused
-    // with `ui_busy`. Hand it to a detached child and get out of the way.
-    static dispatch(action) {
-        recordUse(action.qualifiedId);
-        const child = spawn(
-            process.execPath,
-            [path.join(__dirname, Palette.INVOKER_SCRIPT), action.pluginId, action.actionId],
-            { detached: true, stdio: 'ignore' }
-        );
+    // Neither kind can run from here: this process owns a session-modal popup, so
+    // anything that opens a pane or popup of its own would be refused with
+    // `ui_busy`. Hand the finished command to a detached child and get out of the way.
+    static dispatch(entry, argv) {
+        recordUse(entry.id);
+        const args =
+            entry.kind === 'native'
+                ? ['--command', ...argv]
+                : ['--action', entry.pluginId, entry.actionId];
+        const child = spawn(process.execPath, [path.join(__dirname, Palette.INVOKER_SCRIPT), ...args], {
+            detached: true,
+            stdio: 'ignore',
+        });
         child.unref();
     }
 
+    static async resolveNative(palette, entry, context) {
+        return resolveCommand(entry, context, {
+            promptForInput: (specification) => palette.promptForInput(specification),
+            choicesFor: (selector, excludeContextKey) =>
+                selectorChoices(selector, { context, excludeContextKey }),
+            chooseFrom: async ({ prompt, choices }) => {
+                const picked = await palette.chooseFromList({
+                    prompt,
+                    items: choices,
+                    columnsOf: Palette.choiceColumns,
+                    searchOf: (choice) => choice.label,
+                });
+                return picked === Palette.CANCELLED ? Palette.CANCELLED : picked.value;
+            },
+        });
+    }
+
     static async main() {
-        let actions;
+        const context = Palette.loadContext();
+
+        let entries;
         try {
-            actions = Palette.loadActions();
+            entries = Palette.loadEntries(context);
         } catch (error) {
-            process.stderr.write(`command-palette: could not list plugin actions: ${error.message}\n`);
+            process.stderr.write(`command-palette: could not list commands: ${error.message}\n`);
             return 1;
         }
 
-        const chosen = await new Palette({ actions }).run();
-        if (chosen === null) {
+        const palette = new Palette({});
+        let chosen;
+        let argv = null;
+
+        try {
+            chosen = await palette.chooseFromList({ items: entries });
+            if (chosen !== Palette.CANCELLED && chosen.kind === 'native') {
+                argv = await Palette.resolveNative(palette, chosen, context);
+            }
+        } catch (error) {
+            palette.close();
+            process.stderr.write(`command-palette: ${error.message}\n`);
+            return 1;
+        }
+
+        palette.close();
+
+        if (chosen === Palette.CANCELLED) {
+            return 0;
+        }
+        if (chosen.kind === 'native' && argv === Palette.CANCELLED) {
             return 0;
         }
 
-        Palette.dispatch(chosen);
+        Palette.dispatch(chosen, argv);
         return 0;
     }
 }
