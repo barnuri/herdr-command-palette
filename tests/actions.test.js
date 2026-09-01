@@ -3,13 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const {
-    normalizeAction,
-    runsOnPlatform,
-    searchText,
-    buildActionList,
-    pluginNameLookup,
-} = require('../lib/actions');
+const { normalizeAction, runsOnPlatform, buildPluginEntries, pluginNameLookup } = require('../lib/actions');
+const { searchText } = require('../lib/entries');
 
 function rawAction(overrides = {}) {
     return {
@@ -22,7 +17,7 @@ function rawAction(overrides = {}) {
 }
 
 test('normalizeAction builds a qualified id from plugin and action ids', () => {
-    assert.equal(normalizeAction(rawAction()).qualifiedId, 'acme.tools.do-thing');
+    assert.equal(normalizeAction(rawAction()).id, 'acme.tools.do-thing');
 });
 
 test('normalizeAction falls back to the action id when the title is missing', () => {
@@ -43,7 +38,7 @@ test('runsOnPlatform hides an action that names other platforms only', () => {
 });
 
 test('buildActionList drops actions for other platforms', () => {
-    const built = buildActionList(
+    const built = buildPluginEntries(
         [rawAction(), rawAction({ action_id: 'win-only', platforms: ['windows'] })],
         { platform: 'macos' }
     );
@@ -51,7 +46,7 @@ test('buildActionList drops actions for other platforms', () => {
 });
 
 test('buildActionList excludes the palette own actions', () => {
-    const built = buildActionList(
+    const built = buildPluginEntries(
         [rawAction(), rawAction({ plugin_id: 'barnuri.command-palette', action_id: 'open' })],
         { platform: 'macos', excludePluginId: 'barnuri.command-palette' }
     );
@@ -59,55 +54,24 @@ test('buildActionList excludes the palette own actions', () => {
 });
 
 test('buildActionList labels actions with the plugin display name when known', () => {
-    const [action] = buildActionList([rawAction()], {
+    const [action] = buildPluginEntries([rawAction()], {
         platform: 'macos',
         pluginNames: new Map([['acme.tools', 'Acme Tools']]),
     });
-    assert.equal(action.pluginLabel, 'Acme Tools');
+    assert.equal(action.sourceLabel, 'Acme Tools');
 });
 
 test('buildActionList falls back to the plugin id when no display name is known', () => {
-    const [action] = buildActionList([rawAction()], { platform: 'macos' });
-    assert.equal(action.pluginLabel, 'acme.tools');
-});
-
-test('buildActionList attaches the bound chord for the qualified id', () => {
-    const [action] = buildActionList([rawAction()], {
-        platform: 'macos',
-        chords: new Map([['acme.tools.do-thing', 'prefix+d']]),
-    });
-    assert.equal(action.chord, 'prefix+d');
-});
-
-test('buildActionList sorts recently used actions first', () => {
-    const built = buildActionList(
-        [
-            rawAction({ action_id: 'alpha', title: 'Alpha' }),
-            rawAction({ action_id: 'zulu', title: 'Zulu' }),
-        ],
-        { platform: 'macos', rankOf: (id) => (id === 'acme.tools.zulu' ? 0 : 99) }
-    );
-    assert.deepEqual(built.map((action) => action.actionId), ['zulu', 'alpha']);
-});
-
-test('buildActionList sorts alphabetically by plugin then title when nothing is recent', () => {
-    const built = buildActionList(
-        [
-            rawAction({ plugin_id: 'zeta.plugin', action_id: 'a', title: 'A' }),
-            rawAction({ action_id: 'b', title: 'B thing' }),
-            rawAction({ action_id: 'a', title: 'A thing' }),
-        ],
-        { platform: 'macos' }
-    );
-    assert.deepEqual(built.map((action) => action.title), ['A thing', 'B thing', 'A']);
+    const [action] = buildPluginEntries([rawAction()], { platform: 'macos' });
+    assert.equal(action.sourceLabel, 'acme.tools');
 });
 
 test('buildActionList tolerates a non-array input', () => {
-    assert.deepEqual(buildActionList(undefined), []);
+    assert.deepEqual(buildPluginEntries(undefined), []);
 });
 
 test('searchText covers plugin label, title, description and qualified id', () => {
-    const [action] = buildActionList([rawAction({ description: 'does things' })], {
+    const [action] = buildPluginEntries([rawAction({ description: 'does things' })], {
         platform: 'macos',
         pluginNames: new Map([['acme.tools', 'Acme Tools']]),
     });
